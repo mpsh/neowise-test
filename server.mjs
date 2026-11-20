@@ -9,11 +9,47 @@ function json(response, status, body) {
   response.end(JSON.stringify(body));
 }
 
+const MODEL_TIMEOUT_MS = 300;
+const TOPICS = ["delivery", "pricing", "other"];
+
+// Model output is untrusted: accept only a known topic and a non-empty draft.
+function isValidResult(result) {
+  return (
+    result !== null &&
+    typeof result === "object" &&
+    TOPICS.includes(result.topic) &&
+    typeof result.draft === "string" &&
+    result.draft.trim() !== ""
+  );
+}
+
+async function askModel(text) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), MODEL_TIMEOUT_MS);
+  try {
+    const result = JSON.parse(await classify(text, { signal: controller.signal }));
+    return isValidResult(result) ? { topic: result.topic, draft: result.draft } : null;
+  } catch {
+    return null; // timeout, provider error or non-JSON output
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function handleTriage(request, response) {
   const chunks = [];
   for await (const chunk of request) chunks.push(chunk);
-  const { text } = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-  const result = JSON.parse(await classify(text));
+  let text;
+  try {
+    ({ text } = JSON.parse(Buffer.concat(chunks).toString("utf8")));
+  } catch {
+    return json(response, 400, { status: "invalid_input" });
+  }
+  if (typeof text !== "string" || text.trim() === "") {
+    return json(response, 400, { status: "invalid_input" });
+  }
+  const result = await askModel(text);
+  if (!result) return json(response, 200, { status: "manual_review", topic: null, draft: null });
   return json(response, 200, { status: "ready", ...result });
 }
 
